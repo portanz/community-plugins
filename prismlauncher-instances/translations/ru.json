@@ -5,7 +5,7 @@
   },
   "settings": {
     "launcher_exec_command": {
-      "description": "Запуститm Prismlauncher или его форк по выбору.",
+      "description": "Запустить Prismlauncher или его форк по выбору.",
       "label": "Файл запуска PrismLauncher"
     },
     "prismlauncher_path": {
