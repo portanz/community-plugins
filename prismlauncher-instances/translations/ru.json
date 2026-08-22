@@ -1,1 +1,16 @@
-
+{
+  "no_instances": {
+    "subtitle": "Фильтр: ",
+    "title": "Экземпляры не найдены"
+  },
+  "settings": {
+    "launcher_exec_command": {
+      "description": "Запуститm Prismlauncher или его форк по выбору.",
+      "label": "Файл запуска PrismLauncher"
+    },
+    "prismlauncher_path": {
+      "description": "Путь к PrismLauncher",
+      "label": "Путь PrismLauncher"
+    }
+  }
+}
