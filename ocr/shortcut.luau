@@ -105,3 +105,11 @@ function onRightClick()
 end
 
 render()
+
+function onIpc(event, payload)
+	if event == "region" then
+		grab(false)
+	elseif event == "screen" then
+		grab(true)
+	end
+end
