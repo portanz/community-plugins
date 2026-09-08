@@ -296,6 +296,15 @@
       "description": "用户手动填写的 Spotify 网页 Cookie。它会以普通插件设置保存，但不会写入日志。",
       "label": "Spotify sp_dc"
     },
+    "text_alignment": {
+      "description": "在固定歌词宽度内对齐歌词和歌曲信息。",
+      "label": "文字对齐",
+      "options": {
+        "center": "居中",
+        "left": "左对齐",
+        "right": "右对齐"
+      }
+    },
     "translation_language": {
       "description": "词源支持时优先请求的翻译语言。",
       "label": "歌词翻译语言",

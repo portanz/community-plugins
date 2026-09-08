@@ -21,10 +21,11 @@ run is logged and recorded in an update history with per-package rollback.
 
 - `pacman-contrib` on `PATH` (for `checkupdates` and `pactree`), required.
 - `pacman`, `sh`, `awk`, `sed`, `grep`, `tail`, `head`, `tee`, `wc`, `date`,
-  `rm`, `install`, `test` and `uname`, required — base tools from any
-  standard Arch install (coreutils and friends), used to run and parse the
-  checks, build the download size estimate, check the running kernel,
-  follow and open the update log, and install the optional polkit rule.
+  `rm`, `install`, `test`, `cat`, `kill` and `uname`, required — base tools
+  from any standard Arch install (coreutils and friends), used to run and
+  parse the checks, build the download size estimate, check the running
+  kernel, follow and open the update log, install the optional polkit rule,
+  and detect whether a terminal update run's process is still alive.
 - `pkexec` (polkit) with an authentication agent, required for the
   background update mode and for rollback. Noctalia's built-in polkit agent
   works out of the box.
@@ -53,7 +54,11 @@ noctalia msg panel-toggle yuuto/arch-updater:panel
 The panel groups pending packages by source (Pacman, AUR, Flatpak). Click a
 source row to expand it into its packages. Each package row has an ignore
 button (see **Ignored packages**), a copy button (name and versions) and an
-open button (its page on archlinux.org, the AUR, or Flathub).
+open button (its page on archlinux.org, the AUR, or Flathub). The history
+button next to **Check** opens the plugin's changelog, so you can see what
+changed in each release without leaving the panel. It also opens on its own
+once an update finishes, unless you turn that off with the **Show changelog
+after updating** setting.
 
 **Update** follows the **Update mode** setting:
 
@@ -185,7 +190,7 @@ setting.
 | `hide_polkit_hint` | `bool` | `false` | Hide the panel line offering to install the polkit keep-authorization rule. |
 | `log_lines` | `int` | `14` | How many of the latest update-log lines the panel shows during a run (6–30). |
 | `terminal` | `string` | *(empty)* | Terminal command for terminal-mode updates, the retry fallback and the log viewer. Empty uses Noctalia's detection. |
-| `update_cmd` | `string` | *(empty)* | Full override for the background update command. Empty builds it from the settings above, running pacman through `pkexec`. |
+| `update_cmd` | `string` | *(empty)* | Full override for the update command, in both terminal and background mode. Empty builds it from the settings above. |
 | `glyph` | `glyph` | `package` | The glyph shown for the widget on the bar. |
 | `show_count` | `bool` | `true` | Show the pending-update count next to the bar glyph. |
 | `hide_on_empty` | `bool` | `false` | Hide the widget entirely when there is nothing to show. |

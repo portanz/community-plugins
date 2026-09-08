@@ -2,9 +2,6 @@
 -- Config Swap panel
 
 -- Local variables
-
-local configBox = "~/Config-Swap" 			
-
 local listConfig = nil
 
 local pickSlots = {}
@@ -52,6 +49,34 @@ function isDetect(target: string)
 		return false
 	end
 end
+
+-- Function for data save accross  reset
+
+local function getDataPath()
+	return noctalia.pluginDataDir() .. "/data.json"
+end
+
+local function loadValue()
+	local raw = noctalia.readFile(getDataPath())
+	if not raw then
+		return nil
+	end
+	local ok, decoded = pcall(function()
+		return noctalia.json.decode(raw)
+	end)
+	if not ok or type(decoded) ~= "table" then
+		return nil
+	end
+	return decoded.value
+end
+
+local function saveValue(value)
+	local content = noctalia.json.encode({ value = value })
+	return noctalia.writeFile(getDataPath(), content)
+end
+
+local configBox = loadValue() or "~/Config-Swap"
+local configBoxSave = "~/Config-Swap"
 
 -- Store listing cache
 
@@ -283,6 +308,7 @@ local noctaliaStateDir = resolveStateDir()
 local settingsTomlPath = noctaliaStateDir .. "/settings.toml"	-- Active settings file path
 
 local saveNameInput = "save"
+local customPath = configBox
 
 local function saveConfig()
 	local name = saveNameInput ~= "" and saveNameInput or "save"
@@ -298,7 +324,7 @@ local function saveConfig()
 	local settingFile: infoConfig = {
 		name = name,
 		description = "save for reset",
-		path = configBox .. "/" .. name,
+		path = "config/" .. name,
 		origin = "not give",
 		wallpaperPath = nil,
 		depedencie = false,
@@ -322,7 +348,27 @@ function onSaveNameChange(value)
 	saveNameInput = value
 end
 
-local function renderSetting()
+function onCustomPathChange(value)
+	customPath = value 
+end
+
+function saveCustomPath(value)
+	if value == "" or value == nil then
+		noctalia.notify(tr("title"), tr("error_path"))
+		return
+	end
+	local start = string.sub(value, 1, 2)
+	if start ~= "~/" then
+		noctalia.notify(tr("title"), tr("error_path"))
+		return
+	end
+	configBox = customPath
+	configBox = noctalia.expandPath(value)
+	noctalia.notify(tr("title"), tr("success_path"))
+	saveValue(configBox)
+end
+
+local function renderSetting()				-- Render for setting panel 
 	local rowsSettings = {
 		ui.column({ gap = 8 }, {
 			ui.label({
@@ -336,6 +382,7 @@ local function renderSetting()
 					value = saveNameInput,
 					placeholder = "Save name",
 					onChange = "onSaveNameChange",
+
 					flexGrow = 1,
 				}),
 				ui.button({ text = tr("save"), onClick = function()
@@ -343,6 +390,26 @@ local function renderSetting()
 				end
 				}),
 			}),
+			ui.label({
+				text = "Custom path: enter your custom path following this example: ~/{your path}",
+				fontSize = 12,
+				color = "on_surface_variant",
+			}),
+			ui.row({ flexGrow = 1, gap = 16, align = "center"}, {
+				ui.input({
+					key = "save-name-input",
+					value = customPath,
+					placeholder = "Custom Path",
+					onChange = "onCustomPathChange",
+					flexGrow = 1,
+				}),
+				ui.button({
+					text = "Change path",
+					onClick = function()
+						saveCustomPath(customPath)
+					end
+				})
+			})
 		}),
 	}
 	panel.render(ui.column({ flexGrow = 1, gap = 16 }, {
@@ -395,7 +462,6 @@ local function renderInfoStore()
 end
 
 local function renderList()
-
 	pickSlots = {}
 	local tiles = {}
 	local list = listConfig or {}
@@ -409,28 +475,30 @@ local function renderList()
 
 		local imagePath = previewCache[data.name] or previewImage
 
-		table.insert(tiles, ui.column({ gap = 4, key = data.path, align = "center" }, {
+		table.insert(tiles, ui.column({ gap = 8, key = data.path, align = "stretch", width = previewWidth }, {
 			ui.image({
-      			path = imagePath,
+				path = imagePath,
 				width = previewWidth,
 				height = previewHeight,
 				fit = "cover",
 				radius = 8,
-      			onClick = ""
-  			}),
-			ui.row( {gap = 12, align = "start"}, {
-				ui.button({ text = tr("install"), onClick = function()
+			}),
+			ui.label({
+				text = data.name,
+				fontSize = 14,
+				fontWeight = "medium",
+				color = "on_surface",
+				textAlign = "center",
+				maxLines = 1,
+			}),
+			ui.button({
+				text = tr("install"),
+				variant = "primary",
+				width = previewWidth,
+				onClick = function()
 					downloadConfig(data)
 				end
-				}),
-				ui.label({
-				text = data.name,
-				fontSize = 11,
-				maxLines = 1,
-				maxWidth = 120,
-				textAlign = "center",
-				}),
-			} ), 
+			}),
 		}))
 	end
 	local rows = {}
@@ -445,8 +513,8 @@ local function renderList()
 
 	panel.render(ui.column({ flexGrow = 1, gap = 16 }, {
 		ui.row({ align = "center", justify = "space_between", gap = 8 }, {
-			ui.label({ text = tr("title"), align = "center", fontSize = 16, fontWeight = "bold", color = "on_surface", flexGrow = 1 }),
-			ui.label({ text = tr("store_title"), align = "center", fontSize = 16, fontWeight = "bold", color = "on_surface", flexGrow = 1 }),
+			ui.label({ text = tr("title"), textAlign = "center", fontSize = 16, fontWeight = "bold", color = "on_surface", flexGrow = 1 }),
+			ui.label({ text = tr("store_title"), textAlign = "center", fontSize = 16, fontWeight = "bold", color = "on_surface", flexGrow = 1 }),
 			ui.button({ text = tr("show_list"), onClick = function()
 				selectedView = 1
 				render()
@@ -493,6 +561,9 @@ end
 
 function getListInstall()
 	local localPath = configBox
+	if not noctalia.fileExists(localPath) then
+		noctalia.mkdirAll(localPath)
+	end
 	local list = noctalia.listDir(localPath)
 	local listShow: { infoConfig } = {}
 
@@ -530,8 +601,6 @@ function getListInstall()
 	return listShow
 end
 
--- Render installed configs grid
-
 local function renderInstall()
 	pickSlots = {}
 	local tiles = {}
@@ -540,34 +609,36 @@ local function renderInstall()
 		local data = list[count]
 		local slotIndex = count - 1
 		pickSlots[slotIndex] = data.path
-		table.insert(tiles, ui.column({ gap = 4, key = data.path, align = "center" }, {
+
+		table.insert(tiles, ui.column({ gap = 8, key = data.path, align = "stretch", width = previewWidth }, {
 			ui.image({
-      			path = configBox .. "/" .. data.name .. "/preview.png",
+				path = configBox .. "/" .. data.name .. "/preview.png",
 				width = previewWidth,
 				height = previewHeight,
 				fit = "cover",
 				radius = 8,
-      			onClick = function()
+				onClick = function()
 					renderConfig(data)
 				end
-  			}),
-			ui.row( {gap = 12, align = "start"}, {
-				ui.button({ text = "delete", onClick = function()
+			}),
+			ui.label({
+				text = data.name,
+				fontSize = 14,
+				fontWeight = "medium",
+				color = "on_surface",
+				textAlign = "center",
+				maxLines = 1,
+			}),
+			ui.row({ gap = 8, justify = "space_between", align = "center" }, {
+				ui.button({ text = "delete", variant = "outline", onClick = function()
 					renderDeleteConfirmation(data.name)
 				end
 				}),
-				ui.label({
-				text = data.name,
-				fontSize = 11,
-				maxLines = 1,
-				maxWidth = 120,
-				textAlign = "center",
-				}),
-				ui.button({ text = "apply", onClick = function()
+				ui.button({ text = "apply", variant = "primary", onClick = function()
 					renderConfirmApply(data)
 				end
 				}),
-			} ), 
+			}),
 		}))
 	end
 	local rows = {}
@@ -581,8 +652,8 @@ local function renderInstall()
 	end
 	panel.render(ui.column({ flexGrow = 1, gap = 16 }, {
 		ui.row({ align = "center", justify = "space_between", gap = 8 }, {
-			ui.label({ text = tr("title"), align = "center", fontSize = 16, fontWeight = "bold", color = "on_surface", flexGrow = 1 }),
-			ui.label({ text = tr("installed_title"), align = "center", fontSize = 16, fontWeight = "bold", color = "on_surface", flexGrow = 1 }),
+			ui.label({ text = tr("title"), textAlign = "center", fontSize = 16, fontWeight = "bold", color = "on_surface", flexGrow = 1 }),
+			ui.label({ text = tr("installed_title"), textAlign = "center", fontSize = 16, fontWeight = "bold", color = "on_surface", flexGrow = 1 }),
 			ui.button({ text = tr("show_store"), onClick = function()
 				selectedView = 2
 				render()

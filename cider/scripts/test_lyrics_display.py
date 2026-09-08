@@ -62,6 +62,141 @@ class OverlayCfgTests(unittest.TestCase):
         self.assertNotIn("bg_opacity", cfg.merge_cfg({"bg_opacity": 40}))
 
 
+class PlainScrollTests(unittest.TestCase):
+    LINES = [
+        {"time": -1, "text": "Short"},
+        {"time": -1, "text": "This line is much longer than the first"},
+        {"time": -1, "text": "End"},
+    ]
+
+    def test_is_plain_lyrics(self) -> None:
+        self.assertTrue(cfg.is_plain_lyrics(self.LINES))
+        self.assertFalse(cfg.is_plain_lyrics([{"time": 0, "text": "synced"}]))
+
+    def test_lyrics_are_plain_prefers_bridge_metadata(self) -> None:
+        synced_lines = [{"time": 0, "text": "synced"}]
+        self.assertFalse(
+            cfg.lyrics_are_plain(synced_lines, {"has_synced": True, "message": "synced"})
+        )
+        self.assertTrue(
+            cfg.lyrics_are_plain(self.LINES, {"has_synced": False, "message": "plain"})
+        )
+        # Line heuristics alone must not downgrade synced payloads.
+        self.assertFalse(
+            cfg.lyrics_are_plain(synced_lines, {"has_synced": True, "message": "synced"})
+        )
+
+    def test_lyrics_are_plain_suppressed_message(self) -> None:
+        self.assertTrue(
+            cfg.lyrics_are_plain([], {"message": "plain_suppressed", "has_synced": False})
+        )
+
+    def test_plain_scroll_starts_on_first_line(self) -> None:
+        idx = cfg.plain_scroll_line_index(self.LINES, 0, 120_000, cfg.DEFAULT_CFG)
+        self.assertEqual(idx, 0)
+
+    def test_plain_scroll_reaches_last_line_near_end(self) -> None:
+        idx = cfg.plain_scroll_line_index(self.LINES, 115_000, 120_000, cfg.DEFAULT_CFG)
+        self.assertEqual(idx, 2)
+
+    def test_plain_scroll_weights_longer_lines(self) -> None:
+        lines = [
+            {"time": -1, "text": "A"},
+            {"time": -1, "text": "BBBBBBBBBBBBBBBBBBBBBBBB"},
+            {"time": -1, "text": "C"},
+        ]
+        early = cfg.plain_scroll_line_index(lines, 2_000, 120_000, cfg.DEFAULT_CFG)
+        mid = cfg.plain_scroll_line_index(lines, 60_000, 120_000, cfg.DEFAULT_CFG)
+        self.assertEqual(early, 0)
+        self.assertEqual(mid, 1)
+
+    def test_plain_scroll_respects_speed(self) -> None:
+        slow = cfg.plain_scroll_line_index(
+            self.LINES, 60_000, 120_000, {"plain_scroll_speed": 50}
+        )
+        fast = cfg.plain_scroll_line_index(
+            self.LINES, 60_000, 120_000, {"plain_scroll_speed": 200}
+        )
+        self.assertGreaterEqual(fast, slow)
+
+    def test_resolve_line_uses_plain_scroll(self) -> None:
+        from lyrics_overlay import resolve_line
+
+        cur, nxt, cue, _progress, idx = resolve_line(
+            self.LINES,
+            70_000,
+            dur_ms=120_000,
+            cfg={"show_untimed": True, "plain_scroll": True},
+        )
+        self.assertFalse(cue)
+        self.assertGreater(idx, 0)
+        self.assertTrue(nxt)
+
+    def test_untimed_hidden_by_default(self) -> None:
+        from lyrics_overlay import resolve_line
+
+        cur, nxt, cue, _progress, idx = resolve_line(
+            self.LINES,
+            70_000,
+            dur_ms=120_000,
+            cfg=cfg.DEFAULT_CFG,
+        )
+        self.assertIsNone(cur)
+        self.assertEqual(nxt, "")
+        self.assertFalse(cfg.plain_lyrics_allowed(cfg.DEFAULT_CFG))
+        self.assertFalse(cfg.plain_scroll_enabled(cfg.DEFAULT_CFG))
+
+    def test_silence_gate_holds_during_quiet_intro(self) -> None:
+        # 30s of silence → active_ms=0 should keep line 0 even though wall is mid-song.
+        idx = cfg.plain_scroll_line_index(
+            self.LINES,
+            40_000,
+            120_000,
+            {"show_untimed": True, "plain_scroll": True, "plain_scroll_silence": True, "plain_scroll_speed": 100},
+            active_ms=0,
+        )
+        self.assertEqual(idx, 0)
+
+    def test_silence_gate_advances_on_active_audio(self) -> None:
+        quiet = cfg.plain_scroll_line_index(
+            self.LINES,
+            60_000,
+            120_000,
+            {"plain_scroll_silence": True},
+            active_ms=0,
+        )
+        loud = cfg.plain_scroll_line_index(
+            self.LINES,
+            60_000,
+            120_000,
+            {"plain_scroll_silence": True},
+            active_ms=45_000,
+        )
+        self.assertLess(quiet, loud)
+
+    def test_effective_pos_maps_active_over_remaining(self) -> None:
+        # After quiet intro: wall=60s, active=30s, dur=180 → ~36s effective.
+        pos = cfg.plain_scroll_effective_pos_ms(60_000, 180_000, 30_000, True)
+        self.assertAlmostEqual(pos, 36_000, delta=1)
+
+
+class AudioMeterUnitTests(unittest.TestCase):
+    def test_rms_silence_is_near_zero(self) -> None:
+        from audio_meter import level_from_rms, rms_s16le
+
+        silent = b"\x00\x00" * 200
+        self.assertLess(rms_s16le(silent), 0.001)
+        self.assertLess(level_from_rms(0.0), 0.1)
+
+    def test_rms_loud_sample_registers(self) -> None:
+        from audio_meter import level_from_rms, rms_s16le
+        import struct
+
+        loud = struct.pack("<" + ("h" * 200), *([20000] * 200))
+        self.assertGreater(rms_s16le(loud), 0.4)
+        self.assertGreater(level_from_rms(rms_s16le(loud)), 20)
+
+
 class ClockExtrapolationTests(unittest.TestCase):
     def test_playing_clock_advances_past_eight_seconds(self) -> None:
         now = 1_000_000.0
@@ -88,10 +223,18 @@ class ClockExtrapolationTests(unittest.TestCase):
         far = {"text": "thing", "start": 2_000, "end": 2_200}
         unsung_line = cfg.token_rgba_for_paint(far, 2_000, 2_200, 0, paint)
         self.assertAlmostEqual(unsung_line[0], cfg.NEXT_RGBA[0], places=2)
+        # Fixed palette so active vs sung stay distinct even when Noctalia
+        # theme tokens land on similar greens.
+        contrast = {
+            "sung": (1.0, 1.0, 1.0, 1.0),
+            "active": (1.0, 0.0, 0.0, 1.0),
+            "upcoming": cfg.NEXT_RGBA,
+            "next": cfg.NEXT_RGBA,
+        }
         later = {"text": "thing", "start": 200, "end": 400}
-        live_future = cfg.token_rgba_for_paint(later, 0, 400, 80, paint)
-        self.assertAlmostEqual(live_future[1], paint["active"][1], places=2)
-        self.assertNotAlmostEqual(live_future[1], paint["sung"][1], places=1)
+        live_future = cfg.token_rgba_for_paint(later, 0, 400, 80, contrast)
+        self.assertAlmostEqual(live_future[1], contrast["active"][1], places=2)
+        self.assertNotAlmostEqual(live_future[1], contrast["sung"][1], places=1)
         overlay = (ROOT / "scripts" / "lyrics_overlay.py").read_text(encoding="utf-8")
         self.assertNotIn('self._mul_a(self._paint["sung"], alpha)', overlay)
         self.assertIn("line_only_current_rgba", overlay)
@@ -264,6 +407,44 @@ class CueMixTests(unittest.TestCase):
         self.assertIn("_draw_cue_depth", overlay)
         self.assertNotIn('mix_rgba(self._paint["next"], self._paint["sung"]', overlay)
         self.assertIn("self._draw_karaoke(cr, width, current_y, alpha)", overlay)
+
+    def test_overlay_python_parses(self) -> None:
+        import ast
+
+        src = (ROOT / "scripts" / "lyrics_overlay.py").read_text(encoding="utf-8")
+        ast.parse(src)
+
+    def test_line_anim_direction_follows_seek(self) -> None:
+        self.assertTrue(cfg.line_anim_forward(0))
+        self.assertTrue(cfg.line_anim_forward(40))
+        self.assertTrue(cfg.line_anim_forward(-50))  # mild clock catch-up
+        self.assertFalse(cfg.line_anim_forward(-500))
+        self.assertFalse(cfg.line_anim_forward(-5_000))
+        self.assertTrue(cfg.line_anim_forward_from_index(3, 4))
+        self.assertTrue(cfg.line_anim_forward_from_index(3, 3))
+        self.assertFalse(cfg.line_anim_forward_from_index(5, 2))
+        self.assertEqual(cfg.line_anim_duration_ms(1), cfg.LINE_ANIM_MS)
+        self.assertLess(cfg.line_anim_duration_ms(4), cfg.LINE_ANIM_MS)
+        self.assertGreater(cfg.line_anim_interrupt_elapsed_ms(0.4, 460), 0.0)
+        self.assertEqual(cfg.line_anim_interrupt_elapsed_ms(1.0, 460), 0.0)
+        # Shrink path past → current must work (promote_scale cannot).
+        self.assertAlmostEqual(
+            cfg.depth_layout_scale(
+                0.0, cfg.PAST_FONT_PX, cfg.CURRENT_FONT_PX, cfg.CURRENT_FONT_PX
+            ),
+            cfg.PAST_FONT_PX / cfg.CURRENT_FONT_PX,
+        )
+        self.assertAlmostEqual(
+            cfg.depth_layout_scale(
+                1.0, cfg.PAST_FONT_PX, cfg.CURRENT_FONT_PX, cfg.CURRENT_FONT_PX
+            ),
+            1.0,
+        )
+        overlay = (ROOT / "scripts" / "lyrics_overlay.py").read_text(encoding="utf-8")
+        self.assertIn("_draw_arrive_from_past", overlay)
+        self.assertIn("line_anim_forward_from_index", overlay)
+        self.assertIn("self._anim_forward", overlay)
+        self.assertIn("line_anim_duration_ms", overlay)
 
     def test_cue_dots_grow_forward_not_slide_up(self) -> None:
         # Layout is always CUE_BASE. Incoming visual size is far → base.

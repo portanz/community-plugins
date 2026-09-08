@@ -1,12 +1,12 @@
 id          = "nilsonlinux/rss-notifier"
 name        = "RSS/Atom Notifier"
-version     = "1.0.3"
+version     = "1.0.4"
 plugin_api  = 14
 author      = "Nilsonlinux"
 license     = "MIT"
 icon        = "rss"
 description = "Monitors RSS/Atom feeds and notifies you when new items appear."
-tags        = ["utility", "indicator"]
+tags        = ["utility", "indicator", "panel", "bar", "service"]
 dependencies = ["xdg-open"]
 
 # ---------------------------------------------------------------------------

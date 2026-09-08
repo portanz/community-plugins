@@ -296,6 +296,15 @@
       "description": "Optional manually supplied Spotify web cookie. Stored as a normal plugin setting; never written to logs.",
       "label": "Spotify sp_dc"
     },
+    "text_alignment": {
+      "description": "Align lyrics and track information within the fixed lyric width.",
+      "label": "Text alignment",
+      "options": {
+        "center": "Center",
+        "left": "Left",
+        "right": "Right"
+      }
+    },
     "translation_language": {
       "description": "Preferred translated-lyric language when supported by the source.",
       "label": "Translation language",

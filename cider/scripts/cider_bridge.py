@@ -40,7 +40,7 @@ _WINDOW_POLL_SEC = 0.35
 
 @dataclass
 class TrackEvent:
-    type: str  # track | time | state | lyrics | clear | status
+    type: str  # track | time | state | lyrics | clear | status | art
     title: str = ""
     artist: str = ""
     album: str = ""
@@ -57,6 +57,9 @@ class TrackEvent:
     lyrics_lrc: str = ""
     lyrics_lines: list[dict[str, Any]] | None = None
     message: str = ""
+    # When True, update state.json metadata but leave position.json alone so the
+    # overlay keeps extrapolating from the last real Cider time sample.
+    skip_position: bool = False
 
 
 _EMIT_LOCK = threading.Lock()
@@ -82,9 +85,13 @@ _POS_ANCHOR_MS = 0
 _POS_ANCHOR_WALL = 0.0
 _POS_PLAYING = False
 _POS_DURATION_MS = 0
-# Ignore small backward snaps from stale state/poll samples (not real seeks).
+# Clock hygiene for position.json (overlay extrapolates from these anchors).
+# Untrusted poll/state samples: reject tiny forward spikes, ignore mild behind
+# snaps. Trusted time events (real Cider playbackTimeDidChange / new track)
+# always re-anchor so scrubbing seeks track immediately.
+_AHEAD_REJECT_MS = 400
 _STALE_REWIND_MIN_MS = 350
-_STALE_REWIND_MAX_MS = 4000
+_SEEK_ACCEPT_MS = 1500
 
 
 def _set_position_anchor(position_ms: int, playing: bool, duration_ms: int = 0) -> None:
@@ -112,11 +119,22 @@ def _estimated_position_ms() -> int:
     return est
 
 
-def _write_position(position_ms: int, playing: bool, duration_ms: int = 0) -> None:
+def _write_position(
+    position_ms: int,
+    playing: bool,
+    duration_ms: int = 0,
+    *,
+    trust: bool = False,
+) -> None:
     """Write last-known Cider anchor. HUD/Luau extrapolate between ticks.
 
     Never store wall-clock-extrapolated values here — that double-counts with
-    consumers and lets stale state events yank the sing-along clock backward.
+    consumers.
+
+    trust=True  — live playbackTimeDidChange / new track: always re-anchor so
+                  scrubbing seeks move lyrics immediately.
+    trust=False — poll/state snapshots: reject spurious ahead spikes, ignore
+                  mild behind snaps, but accept |delta| >= SEEK as a seek.
     """
     global _POS_ANCHOR_MS, _POS_ANCHOR_WALL, _POS_PLAYING, _POS_DURATION_MS
     position_ms = max(0, int(position_ms))
@@ -127,16 +145,23 @@ def _write_position(position_ms: int, playing: bool, duration_ms: int = 0) -> No
         if duration_ms:
             _POS_DURATION_MS = duration_ms
         dur = _POS_DURATION_MS
-        if _POS_ANCHOR_WALL > 0 and _POS_PLAYING:
+        if (not trust) and _POS_ANCHOR_WALL > 0 and _POS_PLAYING:
             elapsed = max(0, int((time.time() - _POS_ANCHOR_WALL) * 1000))
             est = _POS_ANCHOR_MS + elapsed
             if dur > 0:
                 est = min(est, dur)
-            rewind = est - position_ms
-            if playing and _STALE_REWIND_MIN_MS <= rewind < _STALE_REWIND_MAX_MS:
-                # Stale sample while still playing — keep extrapolating from old anchor.
-                return
-            if (not playing) and rewind >= _STALE_REWIND_MIN_MS:
+            delta = position_ms - est  # +ahead of clock, -behind
+            if playing:
+                if delta > _AHEAD_REJECT_MS:
+                    # Spurious forward spike from a poll. Forward seeks arrive on
+                    # trusted playbackTimeDidChange ticks instead.
+                    return
+                rewind = -delta
+                if _STALE_REWIND_MIN_MS <= rewind < _SEEK_ACCEPT_MS:
+                    # Mild behind from a stale poll — don't scrub.
+                    return
+                # rewind >= SEEK_ACCEPT: treat as scrub/seek backward.
+            elif (-delta) >= _STALE_REWIND_MIN_MS:
                 # Pause with a stale timestamp: freeze at the live estimate.
                 position_ms = est
 
@@ -154,11 +179,80 @@ def _write_position(position_ms: int, playing: bool, duration_ms: int = 0) -> No
     _atomic_write(_STATE_DIR / "position.json", json.dumps(payload, ensure_ascii=False))
 
 
-def _is_cider_window(app_id: str | None, title: str | None = None) -> bool:
+def _normalize_app_id(app_id: str | None) -> str:
     aid = (app_id or "").strip()
+    if aid.lower().startswith("[xwayland]"):
+        aid = aid.split("]", 1)[1].strip()
+    return aid
+
+
+def _is_cider_window(app_id: str | None, title: str | None = None) -> bool:
+    aid = _normalize_app_id(app_id)
     if aid in _CIDER_APP_IDS or aid.lower() == "cider":
         return True
     return (title or "").strip().lower() == "cider"
+
+
+def _empty_window_probe() -> dict[str, Any]:
+    return {
+        "present": False,
+        "focused": False,
+        "on_screen": False,
+        "suppress_notify": False,
+        "compositor": "none",
+        "t": time.time(),
+    }
+
+
+def _umbriel_windows_text() -> str | None:
+    if not shutil.which("umbriel"):
+        return None
+    try:
+        return subprocess.check_output(
+            ["umbriel", "windows"],
+            stderr=subprocess.DEVNULL,
+            timeout=1.5,
+        ).decode("utf-8")
+    except Exception as exc:
+        log.debug("umbriel windows query failed: %s", exc)
+        return None
+
+
+def _parse_umbriel_windows(text: str) -> list[tuple[bool, str, str]]:
+    rows: list[tuple[bool, str, str]] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        focused = line.startswith("*")
+        rest = line[1:] if focused else line
+        rest = rest.lstrip()
+        parts = rest.split("\t")
+        if len(parts) < 2:
+            continue
+        rows.append((focused, parts[0].strip(), parts[1].strip()))
+    return rows
+
+
+def _probe_umbriel() -> dict[str, Any] | None:
+    text = _umbriel_windows_text()
+    if text is None:
+        return None
+    cider_focused = False
+    cider_present = False
+    for focused, app_id, title in _parse_umbriel_windows(text):
+        if not _is_cider_window(app_id, title):
+            continue
+        cider_present = True
+        if focused:
+            cider_focused = True
+    payload = _empty_window_probe()
+    payload["compositor"] = "umbriel"
+    payload["present"] = cider_present
+    payload["focused"] = cider_focused
+    # Listed windows are mapped on the active layout strip.
+    payload["on_screen"] = cider_present
+    payload["suppress_notify"] = cider_focused or cider_present
+    return payload
 
 
 def _niri_json(cmd: list[str]) -> Any | None:
@@ -240,97 +334,100 @@ def _niri_cider_on_screen(
     return cx < view_right and (cx + cw) > view_left
 
 
-def probe_cider_window() -> dict[str, Any]:
-    """Detect Cider focus / on-screen state for notification suppression."""
-    empty = {
-        "present": False,
-        "focused": False,
-        "on_screen": False,
-        "suppress_notify": False,
-        "compositor": "none",
-        "t": time.time(),
-    }
-    if shutil.which("niri"):
-        windows = _niri_json(["niri", "msg", "-j", "windows"])
-        workspaces = _niri_json(["niri", "msg", "-j", "workspaces"])
-        outputs = _niri_json(["niri", "msg", "-j", "outputs"])
-        if not isinstance(windows, list) or not isinstance(workspaces, list):
-            empty["compositor"] = "niri"
-            return empty
-        cider = next(
-            (
-                w
-                for w in windows
-                if _is_cider_window(w.get("app_id"), w.get("title"))
-            ),
-            None,
-        )
-        if cider is None:
-            empty["compositor"] = "niri"
-            return empty
-        focused = bool(cider.get("is_focused"))
-        on_screen = _niri_cider_on_screen(
-            cider,
-            windows,
-            workspaces,
-            outputs if isinstance(outputs, dict) else {},
-        )
-        return {
+def _probe_niri() -> dict[str, Any] | None:
+    if not shutil.which("niri"):
+        return None
+    windows = _niri_json(["niri", "msg", "-j", "windows"])
+    workspaces = _niri_json(["niri", "msg", "-j", "workspaces"])
+    outputs = _niri_json(["niri", "msg", "-j", "outputs"])
+    if not isinstance(windows, list) or not isinstance(workspaces, list):
+        return None
+    cider = next(
+        (
+            w
+            for w in windows
+            if _is_cider_window(w.get("app_id"), w.get("title"))
+        ),
+        None,
+    )
+    payload = _empty_window_probe()
+    payload["compositor"] = "niri"
+    if cider is None:
+        return payload
+    focused = bool(cider.get("is_focused"))
+    on_screen = _niri_cider_on_screen(
+        cider,
+        windows,
+        workspaces,
+        outputs if isinstance(outputs, dict) else {},
+    )
+    payload.update(
+        {
             "present": True,
             "focused": focused,
             "on_screen": on_screen,
             "suppress_notify": focused or on_screen,
-            "compositor": "niri",
-            "t": time.time(),
         }
+    )
+    return payload
 
-    if shutil.which("hyprctl"):
-        try:
-            clients = json.loads(
-                subprocess.check_output(
-                    ["hyprctl", "clients", "-j"],
-                    stderr=subprocess.DEVNULL,
-                    timeout=1.5,
-                ).decode("utf-8")
-            )
-            active = json.loads(
-                subprocess.check_output(
-                    ["hyprctl", "activewindow", "-j"],
-                    stderr=subprocess.DEVNULL,
-                    timeout=1.5,
-                ).decode("utf-8")
-            )
-        except Exception as exc:
-            log.debug("hyprctl probe failed: %s", exc)
-            empty["compositor"] = "hyprland"
-            return empty
-        cider = next(
-            (
-                c
-                for c in (clients or [])
-                if _is_cider_window(c.get("class"), c.get("title"))
-            ),
-            None,
+
+def _probe_hyprland() -> dict[str, Any] | None:
+    if not shutil.which("hyprctl"):
+        return None
+    try:
+        clients = json.loads(
+            subprocess.check_output(
+                ["hyprctl", "clients", "-j"],
+                stderr=subprocess.DEVNULL,
+                timeout=1.5,
+            ).decode("utf-8")
         )
-        if cider is None:
-            empty["compositor"] = "hyprland"
-            return empty
-        focused = bool(active) and active.get("address") == cider.get("address")
-        # Without viewport math, treat same-workspace mapped window as on-screen.
-        on_screen = focused or (
-            not cider.get("hidden", False)
-            and cider.get("workspace", {}).get("id") == (active or {}).get("workspace", {}).get("id")
+        active = json.loads(
+            subprocess.check_output(
+                ["hyprctl", "activewindow", "-j"],
+                stderr=subprocess.DEVNULL,
+                timeout=1.5,
+            ).decode("utf-8")
         )
-        return {
+    except Exception as exc:
+        log.debug("hyprctl probe failed: %s", exc)
+        return None
+    payload = _empty_window_probe()
+    payload["compositor"] = "hyprland"
+    cider = next(
+        (
+            c
+            for c in (clients or [])
+            if _is_cider_window(c.get("class"), c.get("title"))
+        ),
+        None,
+    )
+    if cider is None:
+        return payload
+    focused = bool(active) and active.get("address") == cider.get("address")
+    on_screen = focused or (
+        not cider.get("hidden", False)
+        and cider.get("workspace", {}).get("id") == (active or {}).get("workspace", {}).get("id")
+    )
+    payload.update(
+        {
             "present": True,
             "focused": focused,
             "on_screen": bool(on_screen),
             "suppress_notify": focused or bool(on_screen),
-            "compositor": "hyprland",
-            "t": time.time(),
         }
+    )
+    return payload
 
-    return empty
+
+def probe_cider_window() -> dict[str, Any]:
+    """Detect Cider focus / on-screen state for notification suppression."""
+    for probe in (_probe_umbriel, _probe_niri, _probe_hyprland):
+        payload = probe()
+        if payload is not None:
+            return payload
+    return _empty_window_probe()
 
 
 def _write_window(payload: dict[str, Any]) -> None:
@@ -358,17 +455,21 @@ def emit(event: TrackEvent) -> None:
     payload = asdict(event)
     if payload.get("lyrics_lines") is None:
         payload.pop("lyrics_lines", None)
+    skip_position = bool(payload.pop("skip_position", False))
     body = json.dumps(payload, ensure_ascii=False)
     with _EMIT_LOCK:
         _STATE_DIR.mkdir(parents=True, exist_ok=True)
         # Continuous snapshot for progress polling
         if event.type in {"track", "time", "state", "art"}:
             _atomic_write(_STATE_DIR / "state.json", body)
-            if event.type in {"track", "time", "state"}:
+            if event.type in {"track", "time", "state"} and not skip_position:
                 _write_position(
                     int(event.position_ms or 0),
                     str(event.playback_state or "") == "playing",
                     int(event.duration_ms or 0),
+                    # Live time ticks + new tracks are authoritative (seeks).
+                    # Snapshot/state polls stay filtered against sprint/scrub noise.
+                    trust=event.type in {"time", "track"},
                 )
         elif event.type == "clear":
             _wipe_playback_sidecars()
@@ -750,6 +851,9 @@ class CiderBridge:
             emit(TrackEvent(type="status", message="disconnected"))
 
     def start(self) -> None:
+        # Drop leftovers from a previous session until a live snapshot arrives.
+        # Otherwise Luau can rehydrate a stale playing track after Cider quit.
+        _wipe_playback_sidecars()
         threading.Thread(target=self._run_sio, name="cider-sio", daemon=True).start()
         if self.poll_interval_sec > 0:
             threading.Thread(target=self._poll_loop, name="cider-poll", daemon=True).start()
@@ -766,9 +870,20 @@ class CiderBridge:
 
     def _window_loop(self) -> None:
         last_body = ""
+        was_present = False
         while not self._stop.is_set():
             try:
                 payload = probe_cider_window()
+                present = payload.get("present") is True
+                # Closing Cider removes its window — clear immediately instead of
+                # waiting for socket/API death (that lag left the bar chip stuck).
+                if was_present and not present:
+                    self._track_key = ""
+                    self._lyrics_key = ""
+                    self._last = {}
+                    emit(TrackEvent(type="clear"))
+                    emit(TrackEvent(type="status", message="cider_closed"))
+                was_present = present
                 body = json.dumps(payload, ensure_ascii=False)
                 if body != last_body:
                     _write_window(payload)
@@ -790,6 +905,12 @@ class CiderBridge:
                     wait_timeout=10,
                 )
             except Exception as exc:
+                # Wipe durable snapshots — otherwise Luau rehydrates a stale
+                # "playing" track from state.json and fires ghost notifications.
+                self._track_key = ""
+                self._lyrics_key = ""
+                self._last = {}
+                emit(TrackEvent(type="clear"))
                 emit(TrackEvent(type="status", message=f"connect_failed:{exc}"))
                 self._stop.wait(5)
 
@@ -895,14 +1016,19 @@ class CiderBridge:
         song_id = str(play_params.get("id") or catalog_id or "")
         isrc = str(attrs.get("isrc") or "")
         duration_ms = int(attrs.get("durationInMillis") or 0)
+        fresh_position = False
         if attrs.get("currentPlaybackTime") is not None:
             position_ms = int(float(attrs["currentPlaybackTime"]) * 1000)
+            fresh_position = True
         elif attrs.get("remainingTime") is not None and duration_ms:
             position_ms = max(0, duration_ms - int(float(attrs["remainingTime"]) * 1000))
+            fresh_position = True
         else:
-            # No fresh Cider timestamp — keep the live extrapolated clock.
-            # Using a stale _last.position_ms rewinds sing-along by up to seconds.
+            # No fresh Cider timestamp — keep the live extrapolated clock in
+            # memory, but do not rewrite position.json (that re-anchored `t`
+            # and could amplify drift).
             position_ms = _estimated_position_ms() if self._last else 0
+            fresh_position = False
 
         artwork = attrs.get("artwork") or {}
         artwork_url = ""
@@ -942,6 +1068,8 @@ class CiderBridge:
             event_type = "track"
         elif reason == "track" and not is_new_track:
             event_type = "state"
+        # New tracks always need a position anchor; metadata-only snapshots do not.
+        skip_position = (not fresh_position) and event_type != "track"
         event = TrackEvent(
             type=event_type,
             title=title,
@@ -957,6 +1085,7 @@ class CiderBridge:
             isrc=isrc,
             has_lyrics=bool(attrs.get("hasLyrics")),
             has_synced=bool(attrs.get("hasTimeSyncedLyrics")),
+            skip_position=skip_position,
         )
         self._last = asdict(event)
         self._last["playback_state"] = state
@@ -995,7 +1124,9 @@ class CiderBridge:
             if dest.exists() and dest.stat().st_size > 0:
                 return str(dest)
             try:
-                resp = self._session.get(url, timeout=10)
+                # Tokened Session is only for Cider's local API. Artwork URLs are
+                # Apple Music CDN (*.mzstatic.com) — same bare get as LRCLIB.
+                resp = requests.get(url, timeout=10)
                 resp.raise_for_status()
                 if not resp.content:
                     return ""

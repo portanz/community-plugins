@@ -60,10 +60,19 @@ from lyrics_overlay_cfg import (  # noqa: E402
     hud_height_px,
     is_cue_text,
     layer_anchors,
+    line_anim_duration_ms,
+    line_anim_forward_from_index,
+    line_anim_interrupt_elapsed_ms,
+    is_plain_lyrics,
+    lyrics_are_plain,
     merge_cfg,
     next_line_y,
     outro_lyric_alpha,
     overlay_should_show,
+    plain_lyrics_allowed,
+    plain_scroll_enabled,
+    plain_scroll_line_index,
+    plain_scroll_silence_enabled,
     approach_u,
     promote_scale,
     promote_top_y,
@@ -78,6 +87,7 @@ from lyrics_overlay_cfg import (  # noqa: E402
     track_cross_alphas,
     group_karaoke_words,
 )
+from audio_meter import AudioMeter  # noqa: E402
 
 CACHE = Path(os.path.expanduser("~/.cache/noctalia-cider"))
 HUD_PATH = CACHE / "hud.json"
@@ -171,10 +181,45 @@ def _real_words(line: dict[str, Any]) -> list[dict[str, Any]]:
     return restore_word_spacing(words, text)
 
 
-def resolve_line(lines: list[dict[str, Any]], pos_ms: int) -> tuple[dict[str, Any] | None, str, bool, float]:
+def resolve_line(
+    lines: list[dict[str, Any]],
+    pos_ms: int,
+    *,
+    dur_ms: int = 0,
+    cfg: dict[str, Any] | None = None,
+    active_ms: int | None = None,
+) -> tuple[dict[str, Any] | None, str, bool, float, int]:
     if not lines:
-        return None, "", False, 0.0
+        return None, "", False, 0.0, 0
     pos_ms = max(0, pos_ms)
+    if cfg and lyrics_are_plain(lines):
+        if not plain_lyrics_allowed(cfg):
+            return None, "", False, 0.0, 0
+        if plain_scroll_enabled(cfg):
+            idx = plain_scroll_line_index(
+                lines,
+                pos_ms,
+                dur_ms,
+                cfg,
+                active_ms=active_ms,
+            )
+            cur = lines[idx]
+            nxt = ""
+            for j in range(idx + 1, len(lines)):
+                txt = _line_text(lines[j])
+                if txt and not _is_cue(lines[j]):
+                    nxt = txt
+                    break
+            return cur, nxt, False, 0.0, idx
+        # Allowed but no scroll: stay on the first line.
+        cur = lines[0]
+        nxt = ""
+        for j in range(1, len(lines)):
+            txt = _line_text(lines[j])
+            if txt and not _is_cue(lines[j]):
+                nxt = txt
+                break
+        return cur, nxt, False, 0.0, 0
     idx = 0
     for i, line in enumerate(lines):
         t = line.get("time")
@@ -190,7 +235,13 @@ def resolve_line(lines: list[dict[str, Any]], pos_ms: int) -> tuple[dict[str, An
         ft = int(first.get("time") or 0)
         if ft > pos_ms:
             progress = _clamp01(pos_ms / ft) if ft > 0 else 0.0
-            return {"text": CUE_TEXT, "cue": True, "time": 0, "duration": ft}, _line_text(first), True, progress
+            return (
+                {"text": CUE_TEXT, "cue": True, "time": 0, "duration": ft},
+                _line_text(first),
+                True,
+                progress,
+                0,
+            )
         idx = 1
     cur = lines[idx - 1]
     nxt = ""
@@ -211,7 +262,7 @@ def resolve_line(lines: list[dict[str, Any]], pos_ms: int) -> tuple[dict[str, An
                 finish = int(nt)
         if finish > start:
             progress = _clamp01((pos_ms - start) / (finish - start))
-    return cur, nxt, cue, progress
+    return cur, nxt, cue, progress, idx
 
 
 class LyricsHud(Gtk.Window):
@@ -262,6 +313,9 @@ class LyricsHud(Gtk.Window):
         self._width = 800
         self._line_key: tuple[str, str, bool] | None = None
         self._anim_t0 = 0.0
+        self._anim_ms = float(LINE_ANIM_MS)
+        self._anim_forward = True
+        self._line_idx = 0
         self._outgoing_current = ""
         self._outgoing_next = ""
         self._incoming_current = ""
@@ -276,6 +330,10 @@ class LyricsHud(Gtk.Window):
         self._hold_current = ""
         self._hold_next = ""
         self._hold_was_cue = False
+        self._plain_active_ms = 0.0
+        self._plain_last_tick = 0.0
+        self._meter = AudioMeter()
+        self._meter_wanted = False
         self.set_size_request(100, HUD_HEIGHT)
         self.connect("realize", self._apply_click_through)
         self.connect("map", self._apply_click_through)
@@ -364,6 +422,7 @@ class LyricsHud(Gtk.Window):
         self._note_surface(want)
         surface_u = self._surface_progress()
         if surface_u <= 0.001:
+            self._sync_meter(False)
             return True
 
         lyrics = _read_json(LYRICS_PATH) or {}
@@ -388,7 +447,12 @@ class LyricsHud(Gtk.Window):
             self._track_anim_t0 = time.time()
             self._awaiting_lyrics = True
             self._anim_t0 = 0.0
+            self._anim_ms = float(LINE_ANIM_MS)
+            self._anim_forward = True
             self._line_key = None
+            self._line_idx = 0
+            self._plain_active_ms = 0.0
+            self._plain_last_tick = 0.0
         if play_id:
             self._play_id = play_id
         lyrics_id = display_track_id(lyrics)
@@ -400,8 +464,35 @@ class LyricsHud(Gtk.Window):
                 self._track_anim_t0 = time.time()
                 self._track_start_u = 0.52
 
-        self._current, self._next, self._is_cue, self._cue_progress = resolve_line(lines, self._pos_ms)
-        self._note_line_change()
+        plain = lyrics_are_plain(lines, lyrics)
+        silence_gate = plain_scroll_silence_enabled(self._cfg) and plain
+        self._sync_meter(silence_gate)
+        active_ms: int | None = None
+        if silence_gate:
+            self._meter.set_threshold(float(self._cfg.get("plain_scroll_silence_level") or 8))
+            snap = self._meter.snapshot()
+            now = time.time()
+            if self._plain_last_tick > 0 and self._playing and snap.get("active") is True:
+                delta = max(0.0, (now - self._plain_last_tick) * 1000.0)
+                # Cap so a stalled GTK tick cannot jump the scroll clock.
+                self._plain_active_ms += min(delta, float(TICK_MS) * 3.0)
+            self._plain_last_tick = now
+            active_ms = int(self._plain_active_ms)
+        else:
+            self._plain_last_tick = 0.0
+
+        # Untimed lyrics opt-in: hide when show_untimed is off.
+        if plain and not plain_lyrics_allowed(self._cfg):
+            lines = []
+
+        self._current, self._next, self._is_cue, self._cue_progress, line_idx = resolve_line(
+            lines,
+            int(self._pos_ms),
+            dur_ms=dur,
+            cfg=self._cfg,
+            active_ms=active_ms,
+        )
+        self._note_line_change(line_idx)
 
         # Match monitor width for centered layout.
         try:
@@ -419,6 +510,15 @@ class LyricsHud(Gtk.Window):
 
         self._drawing.queue_draw()
         return True
+
+    def _sync_meter(self, want: bool) -> None:
+        if want and not self._meter_wanted:
+            self._meter.start()
+            self._meter_wanted = True
+        elif not want and self._meter_wanted:
+            self._meter.stop()
+            self._meter_wanted = False
+            self._plain_last_tick = 0.0
 
     def _draw_drop_shadow(
         self,
@@ -463,20 +563,38 @@ class LyricsHud(Gtk.Window):
             return CUE_TEXT
         return _line_text(self._current)
 
-    def _note_line_change(self) -> None:
+    def _note_line_change(self, line_idx: int) -> None:
         incoming = self._current_text()
         key = (incoming, self._next, self._is_cue)
         if key == self._line_key:
+            self._line_idx = int(line_idx)
             return
         if self._line_key is not None and self._track_anim_t0 <= 0:
+            prev_idx = int(self._line_idx)
+            next_idx = int(line_idx)
+            forward = line_anim_forward_from_index(prev_idx, next_idx)
+            prev_u = 1.0
+            if self._anim_t0 > 0:
+                elapsed = (time.time() - self._anim_t0) * 1000.0
+                dur = max(1.0, float(self._anim_ms))
+                if elapsed < dur:
+                    prev_u = smoothstep(elapsed / dur)
             self._outgoing_current = self._incoming_current
             self._outgoing_next = self._incoming_next
-            self._anim_t0 = time.time()
+            self._anim_forward = forward
+            self._anim_ms = float(
+                line_anim_duration_ms(next_idx - prev_idx, LINE_ANIM_MS)
+            )
+            soft = line_anim_interrupt_elapsed_ms(prev_u, int(self._anim_ms))
+            self._anim_t0 = time.time() - (soft / 1000.0)
         else:
             self._anim_t0 = 0.0
+            self._anim_ms = float(LINE_ANIM_MS)
+            self._anim_forward = True
         self._incoming_current = incoming
         self._incoming_next = self._next
         self._line_key = key
+        self._line_idx = int(line_idx)
 
     def _mix_alphas(self) -> tuple[float, float, float]:
         """hold (outgoing track), live (current track), mix-dots."""
@@ -503,10 +621,11 @@ class LyricsHud(Gtk.Window):
         if self._anim_t0 <= 0:
             return 1.0
         elapsed = (time.time() - self._anim_t0) * 1000.0
-        if elapsed >= LINE_ANIM_MS:
+        dur = max(1.0, float(self._anim_ms or LINE_ANIM_MS))
+        if elapsed >= dur:
             self._anim_t0 = 0.0
             return 1.0
-        return smoothstep(elapsed / LINE_ANIM_MS)
+        return smoothstep(elapsed / dur)
 
     def _wrap_layout(
         self,
@@ -590,11 +709,12 @@ class LyricsHud(Gtk.Window):
         bold: bool,
         max_lines: int,
     ) -> int:
-        """One depth step on the 2D plane: smaller/further → larger/nearer."""
+        """One depth step on the 2D plane: smaller/further ↔ larger/nearer."""
         if not text or rgba[3] <= 0.01:
             return 0
-        scale = promote_scale(u, start_px, dest_px)
-        layout, cw = self._wrap_layout(text, dest_px, bold, width, max_lines)
+        layout_px = max(int(start_px), int(dest_px), 1)
+        scale = depth_layout_scale(u, start_px, dest_px, layout_px)
+        layout, cw = self._wrap_layout(text, layout_px, bold, width, max_lines)
         _tw, th = layout.get_pixel_size()
         if th <= 0:
             return 0
@@ -627,6 +747,31 @@ class LyricsHud(Gtk.Window):
         body_h = max(1.0, float(self._current_body_h(width)))
         vis_h = body_h * scale
         top = promote_top_y(u, current_y, next_y)
+        cx = width / 2.0
+        rest_cy = current_y + body_h / 2.0
+        pose_cy = top + vis_h / 2.0
+        cr.save()
+        cr.translate(cx, pose_cy)
+        cr.scale(scale, scale)
+        cr.translate(-cx, -rest_cy)
+        self._draw_karaoke(cr, width, current_y, alpha)
+        cr.restore()
+        return int(max(1, vis_h))
+
+    def _draw_arrive_from_past(
+        self,
+        cr: Any,
+        width: int,
+        current_y: float,
+        u: float,
+        alpha: float,
+    ) -> int:
+        """Past pose → current pose (rewind / skip-back)."""
+        past_y = current_y - PAST_LIFT_PX
+        scale = depth_layout_scale(u, PAST_FONT_PX, CURRENT_FONT_PX, CURRENT_FONT_PX)
+        body_h = max(1.0, float(self._current_body_h(width)))
+        vis_h = body_h * scale
+        top = promote_top_y(u, current_y, past_y)
         cx = width / 2.0
         rest_cy = current_y + body_h / 2.0
         pose_cy = top + vis_h / 2.0
@@ -864,59 +1009,133 @@ class LyricsHud(Gtk.Window):
             if show_live and not idle:
                 body_h = self._current_body_h(width)
                 next_slot_y = next_line_y(y, body_h)
+                forward = self._anim_forward
                 if anim_u < 1.0 and self._outgoing_current and not show_hold:
                     out_a = exit_alpha(anim_u) * live_a
                     if is_cue_text(self._outgoing_current):
-                        self._draw_cue_depth(
-                            cr,
-                            width,
-                            y - FAR_DROP_PX,
-                            y,
-                            CUE_PAST_PX,
-                            CUE_BASE_PX,
-                            anim_u,
-                            out_a,
-                        )
+                        if forward:
+                            self._draw_cue_depth(
+                                cr,
+                                width,
+                                y - FAR_DROP_PX,
+                                y,
+                                CUE_PAST_PX,
+                                CUE_BASE_PX,
+                                anim_u,
+                                out_a,
+                            )
+                        else:
+                            self._draw_cue_depth(
+                                cr,
+                                width,
+                                y + FAR_DROP_PX,
+                                y,
+                                CUE_FAR_PX,
+                                CUE_BASE_PX,
+                                anim_u,
+                                out_a,
+                            )
                     else:
                         sung = self._paint["sung"]
-                        self._draw_depth_line(
-                            cr,
-                            width,
-                            self._outgoing_current,
-                            y - PAST_LIFT_PX,
-                            y,
-                            PAST_FONT_PX,
-                            CURRENT_FONT_PX,
-                            anim_u,
-                            (sung[0], sung[1], sung[2], sung[3] * out_a),
-                            True,
-                            CURRENT_MAX_LINES,
-                        )
+                        if forward:
+                            self._draw_depth_line(
+                                cr,
+                                width,
+                                self._outgoing_current,
+                                y - PAST_LIFT_PX,
+                                y,
+                                PAST_FONT_PX,
+                                CURRENT_FONT_PX,
+                                anim_u,
+                                (sung[0], sung[1], sung[2], sung[3] * out_a),
+                                True,
+                                CURRENT_MAX_LINES,
+                            )
+                        elif self._incoming_next == self._outgoing_current:
+                            # One-line skip-back: demote into the next slot.
+                            nxt = self._paint["next"]
+                            land_a = 1.0 + (float(nxt[3]) - 1.0) * smoothstep(
+                                anim_u
+                            )
+                            self._draw_depth_line(
+                                cr,
+                                width,
+                                self._outgoing_current,
+                                next_slot_y,
+                                y,
+                                NEXT_FONT_PX,
+                                CURRENT_FONT_PX,
+                                anim_u,
+                                (
+                                    sung[0],
+                                    sung[1],
+                                    sung[2],
+                                    sung[3] * land_a * live_a,
+                                ),
+                                True,
+                                CURRENT_MAX_LINES,
+                            )
+                        else:
+                            # Multi-line rewind: exit toward far.
+                            self._draw_depth_line(
+                                cr,
+                                width,
+                                self._outgoing_current,
+                                y + FAR_DROP_PX,
+                                y,
+                                FAR_FONT_PX,
+                                CURRENT_FONT_PX,
+                                anim_u,
+                                (sung[0], sung[1], sung[2], sung[3] * out_a),
+                                True,
+                                CURRENT_MAX_LINES,
+                            )
                 if self._is_cue:
                     if anim_u < 1.0:
-                        self._draw_cue_depth(
-                            cr,
-                            width,
-                            y,
-                            y + FAR_DROP_PX,
-                            CUE_BASE_PX,
-                            CUE_FAR_PX,
-                            anim_u,
-                            live_a,
-                        )
+                        if forward:
+                            self._draw_cue_depth(
+                                cr,
+                                width,
+                                y,
+                                y + FAR_DROP_PX,
+                                CUE_BASE_PX,
+                                CUE_FAR_PX,
+                                anim_u,
+                                live_a,
+                            )
+                        else:
+                            self._draw_cue_depth(
+                                cr,
+                                width,
+                                y,
+                                y - FAR_DROP_PX,
+                                CUE_BASE_PX,
+                                CUE_PAST_PX,
+                                anim_u,
+                                live_a,
+                            )
                     else:
                         self._draw_cue_dots(cr, width, y, live_a)
                     current_h = CURRENT_SLOT_PX
                 elif anim_u < 1.0:
-                    self._draw_promote_line(
-                        cr,
-                        width,
-                        self._incoming_current,
-                        y,
-                        next_slot_y,
-                        anim_u,
-                        live_a,
-                    )
+                    if forward:
+                        self._draw_promote_line(
+                            cr,
+                            width,
+                            self._incoming_current,
+                            y,
+                            next_slot_y,
+                            anim_u,
+                            live_a,
+                        )
+                    else:
+                        self._draw_arrive_from_past(
+                            cr,
+                            width,
+                            y,
+                            anim_u,
+                            live_a,
+                        )
                     current_h = body_h
                 else:
                     current_h = self._draw_karaoke(cr, width, y, live_a)
@@ -941,42 +1160,97 @@ class LyricsHud(Gtk.Window):
                         next_max,
                     )
                 if show_live and not idle:
-                    growing = anim_u < 1.0 and not self._is_cue
+                    demote_fills_next = (
+                        anim_u < 1.0
+                        and not self._is_cue
+                        and not self._anim_forward
+                        and bool(self._outgoing_current)
+                        and self._incoming_next == self._outgoing_current
+                    )
+                    promote_busy = (
+                        anim_u < 1.0
+                        and not self._is_cue
+                        and self._anim_forward
+                    )
                     if (
                         anim_u < 1.0
                         and self._outgoing_next
                         and not show_hold
-                        and not growing
+                        and not promote_busy
                     ):
                         r, g, b, a = self._paint["next"]
-                        self._draw_plain_line(
-                            cr,
-                            width,
-                            y,
-                            self._outgoing_next,
-                            (r, g, b, a * (1.0 - anim_u) * live_a),
-                            13,
-                            False,
-                            next_max,
-                        )
-                    if self._incoming_next:
+                        if self._anim_forward:
+                            self._draw_plain_line(
+                                cr,
+                                width,
+                                y,
+                                self._outgoing_next,
+                                (r, g, b, a * (1.0 - anim_u) * live_a),
+                                13,
+                                False,
+                                next_max,
+                            )
+                        else:
+                            # Rewind: former next sinks further into far.
+                            self._draw_depth_line(
+                                cr,
+                                width,
+                                self._outgoing_next,
+                                y + FAR_DROP_PX,
+                                y,
+                                FAR_FONT_PX,
+                                NEXT_FONT_PX,
+                                anim_u,
+                                (r, g, b, a * (1.0 - anim_u) * live_a),
+                                False,
+                                next_max,
+                            )
+                    if self._incoming_next and not demote_fills_next:
                         r, g, b, a = self._paint["next"]
                         if anim_u < 1.0:
-                            au = approach_u(anim_u)
-                            if au > 0.01:
-                                self._draw_depth_line(
-                                    cr,
-                                    width,
-                                    self._incoming_next,
-                                    y,
-                                    y + FAR_DROP_PX,
-                                    NEXT_FONT_PX,
-                                    FAR_FONT_PX,
-                                    au,
-                                    (r, g, b, a * successor_next_alpha(anim_u) * live_a),
-                                    False,
-                                    next_max,
-                                )
+                            if self._anim_forward:
+                                au = approach_u(anim_u)
+                                if au > 0.01:
+                                    self._draw_depth_line(
+                                        cr,
+                                        width,
+                                        self._incoming_next,
+                                        y,
+                                        y + FAR_DROP_PX,
+                                        NEXT_FONT_PX,
+                                        FAR_FONT_PX,
+                                        au,
+                                        (
+                                            r,
+                                            g,
+                                            b,
+                                            a * successor_next_alpha(anim_u) * live_a,
+                                        ),
+                                        False,
+                                        next_max,
+                                    )
+                            else:
+                                # Multi-line rewind: new next settles from past.
+                                au = approach_u(anim_u)
+                                if au > 0.01:
+                                    self._draw_depth_line(
+                                        cr,
+                                        width,
+                                        self._incoming_next,
+                                        y,
+                                        y - PAST_LIFT_PX * 0.45,
+                                        NEXT_FONT_PX,
+                                        CURRENT_FONT_PX,
+                                        au,
+                                        (
+                                            r,
+                                            g,
+                                            b,
+                                            a * successor_next_alpha(anim_u) * live_a,
+                                        ),
+                                        False,
+                                        next_max,
+                                    )
                         else:
                             self._draw_plain_line(
                                 cr,
@@ -1017,10 +1291,22 @@ def main() -> int:
     pid_path.write_text(str(os.getpid()), encoding="utf-8")
 
     win = LyricsHud()
-    win.connect("destroy", Gtk.main_quit)
+
+    def _shutdown(*_args: Any) -> None:
+        try:
+            win._sync_meter(False)
+        except Exception:
+            pass
+        Gtk.main_quit()
+
+    win.connect("destroy", _shutdown)
     try:
         Gtk.main()
     finally:
+        try:
+            win._sync_meter(False)
+        except Exception:
+            pass
         try:
             if pid_path.exists() and pid_path.read_text().strip() == str(os.getpid()):
                 pid_path.unlink(missing_ok=True)
