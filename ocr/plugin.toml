@@ -3,14 +3,21 @@
 # over it, and copy the recognized text to the clipboard.
 #
 # Click mapping (widget): left = OCR a selected region, right = OCR the whole
-# focused output. The shortcut mirrors both.
+# focused output. The shortcut mirrors both. A compositor keybind can trigger
+# the same actions directly via:
+#   noctalia msg plugin fel/ocr:service all region
+#   noctalia msg plugin fel/ocr:service all screen
 #
-# Settings are plugin-level ([[setting]] at the root): one set shared by both
-# entries, edited from Settings → Plugins.
+# The actual capture pipeline lives in the [[service]] entry below, so it
+# keeps working whether or not the bar widget or shortcut is placed anywhere
+# — the widget and shortcut are thin clients that dispatch to it.
+#
+# Settings are plugin-level ([[setting]] at the root): one set shared by all
+# three entries, edited from Settings → Plugins.
 
 id = "fel/ocr"
 name = "OCR"
-version = "1.0.4"
+version = "2.0.0"
 plugin_api = 3
 author = "Fel"
 license = "MIT"
@@ -51,7 +58,16 @@ label_key = "settings.show_notification.label"
 description_key = "settings.show_notification.description"
 default = true
 
+# Headless service: owns the real capture pipeline (slurp/grim/tesseract) and
+# runs for the whole session as soon as the plugin is enabled, independent of
+# whether the widget or shortcut below are placed. Address it with `all` in
+# IPC, since it's a singleton with no output of its own.
+[[service]]
+id = "service"
+entry = "service.luau"
+
 # Bar tile: left click = OCR region, right click = OCR focused output.
+# Thin client — dispatches to the service above.
 [[widget]]
 id = "ocr"
 entry = "ocr.luau"
@@ -63,6 +79,7 @@ entry = "ocr.luau"
   default = "scan"
 
 # Control-center quick tile mirroring the widget's click mapping.
+# Thin client — dispatches to the service above.
 [[shortcut]]
 id = "grab"
 entry = "shortcut.luau"
